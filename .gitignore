@@ -130,3 +130,27 @@ dmypy.json
 
 # Unused example outputs
 examples/
+
+# Abaqus generated files
+*.odb
+*.dat
+*.sta
+*.msg
+*.res
+*.prt
+*.com
+*.sim
+*.inp
+*.log
+*.cae
+*.jnl
+*.lck
+*.sel
+
+# Project results and data
+results/
+data/
+abaqus_models/
+*.txt
+!requirements.txt
+!README.md

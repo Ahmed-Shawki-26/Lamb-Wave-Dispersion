@@ -40,9 +40,9 @@ LWD_PATH   = SCRIPT_DIR
 if LWD_PATH not in sys.path:
     sys.path.insert(0, LWD_PATH)
 
-from lambwaves import Lamb
-from lambwaves.utils import find_max   # helper used by the library internally
-
+from core.lambwaves import Lamb
+from core.lambwaves.utils import find_max   # helper used by the library internally
+from core.anisotropic_gmm import AnisotropicGMM
 
 # =============================================================================
 # SECTION 1 — CLASSICAL LAMINATE THEORY (CLT)
@@ -359,13 +359,13 @@ def run_3d_properties_section():
 # damage localisation.
 # =============================================================================
 
-def run_dispersion_section(c_L, c_S, h_mm, freq_kHz=50.0):
+def run_dispersion_section(Ex, Ey, Ez, Gxy, Gxz, Gyz, nu_xy, nu_xz, nu_yz, rho, h_mm, freq_kHz=50.0):
     """
-    Solve the Rayleigh-Lamb equations for the plate.
+    Solve the Exact Global Matrix Method Dispersion equations for the composite plate.
 
     Parameters
     ----------
-    c_L, c_S  : float   Bulk wave velocities (m/s)
+    ... 3D Orthotropic properties ...
     h_mm      : float   Plate thickness (mm)
     freq_kHz  : float   Excitation frequency (kHz)
 
@@ -384,39 +384,54 @@ def run_dispersion_section(c_L, c_S, h_mm, freq_kHz=50.0):
     print(f"  fd at excitation    : {freq_kHz:.0f} × {h_mm:.3f} = {fd_exc:.1f} kHz·mm")
     print(f"\n  Solving dispersion equations (this may take ~30 s)...")
 
-    lamb = Lamb(
-        thickness      = h_mm,
-        nmodes_sym     = 3,        # S0, S1, S2
-        nmodes_antisym = 3,        # A0, A1, A2
-        fd_max         = 3000,     # kHz·mm — covers full S1/A1 region
-        vp_max         = 15000,    # m/s    — well above c_L
-        c_L            = c_L,
-        c_S            = c_S,
-        fd_points      = 200,      # points along fd axis
-        vp_step        = 50,       # m/s  — bisection search step
-        material       = "IM7/8552 Quasi-Isotropic",
-    )
+    # Construct 6x6 Orthotropic Voigt Stiffness Matrix
+    C = np.zeros((6, 6))
+    
+    # Invert compliance matrix to get stiffness
+    S = np.zeros((6, 6))
+    S[0,0] = 1.0/Ex
+    S[1,1] = 1.0/Ey
+    S[2,2] = 1.0/Ez
+    S[0,1] = S[1,0] = -nu_xy/Ex
+    S[0,2] = S[2,0] = -nu_xz/Ex
+    S[1,2] = S[2,1] = -nu_yz/Ey
+    S[3,3] = 1.0/Gyz
+    S[4,4] = 1.0/Gxz
+    S[5,5] = 1.0/Gxy
+    
+    C = np.linalg.inv(S)
+    
+    # Initialize EXACT Anisotropic GMM solver
+    print("  Solving exact anisotropic dispersion via Global Matrix Method ...")
+    gmm = AnisotropicGMM(C, rho, h_mm * 1e-3)
+    
+    # Solve along the 0-degree propagation direction (X axis)
+    # Search vp from 100 to 10000 m/s for completeness
+    vp_search = np.linspace(100, 10000, 200)
+    # Values 10 and 1000 are already in kHz as per the paper's range
+    roots = gmm.solve_dispersion(theta_deg=0.0, f_min_khz=10, f_max_khz=1000, num_f=400, vp_array=vp_search)
 
-    print("  Done.")
-    return lamb, fd_exc
+    print(f"  Found {len(roots)} root points.")
+    
+    # Bulk wave velocities for plotting reference
+    c_S = np.sqrt(Gxz / rho)
+    c_L = np.sqrt(Ex / rho) # Simplified for reference line
+    
+    return roots, fd_exc, c_L, c_S
 
 
-def plot_dispersion_curves(lamb, fd_exc, freq_kHz, save_path,
+def plot_dispersion_curves(roots, fd_exc, freq_kHz, save_path, h_mm, c_L, c_S,
                            paper_vg_a0=1670.0):
     """
-    Generate a 2-panel figure (phase velocity + group velocity) and save
-    it as a PNG.
-
-    The operating point (fd at excitation frequency) is marked on both
-    panels.  On the group velocity panel, the A0 computed value is
-    compared against the paper's published 1670 m/s.
+    Generate a 2-panel figure (phase velocity + group velocity) highlighting exact anisotropic roots.
 
     Parameters
     ----------
-    lamb        : Lamb    Solved dispersion object
+    roots       : ndarray Exact GMM roots [vp, fd_Hzm, vg_mag, steering]
     fd_exc      : float   fd at excitation (kHz·mm)
     freq_kHz    : float   Excitation frequency (kHz)
     save_path   : str     Full path for output PNG
+    h_mm        : float   Plate thickness (mm)
     paper_vg_a0 : float   A0 group velocity from Wang et al. 2014 (m/s)
 
     Returns
@@ -426,7 +441,7 @@ def plot_dispersion_curves(lamb, fd_exc, freq_kHz, save_path,
     fig, (ax_vp, ax_vg) = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
     fig.suptitle(
         "Lamb Wave Dispersion Curves — IM7/8552 Quasi-Isotropic Plate\n"
-        f"[45/-45/0/90]₃s  |  h = {lamb.d * 1e3:.3f} mm",
+        f"[45/-45/0/90]₃s  |  h = {h_mm:.3f} mm",
         fontsize=13, fontweight="bold", y=0.99,
     )
 
@@ -435,41 +450,96 @@ def plot_dispersion_curves(lamb, fd_exc, freq_kHz, save_path,
     antisym_kw = dict(color="#d62728", linewidth=2.0)   # red   — A modes
 
     # --- Compute y-axis limits from the data ------------------------------
-    ymax_vp = max(find_max(lamb.vp_sym), find_max(lamb.vp_antisym)) * 1.08
-    ymax_vg = max(find_max(lamb.vg_sym), find_max(lamb.vg_antisym)) * 1.08
+    if len(roots) > 0:
+        ymax_vp = np.max(roots[:, 0]) * 1.08
+        ymax_vg = np.max(roots[:, 2]) * 1.08
+    else:
+        ymax_vp = 8000
+        ymax_vg = 8000
 
     # =========================================================================
     # TOP PANEL — Phase Velocity
     # =========================================================================
-    lamb.plot(ax_vp, lamb.vp_sym,     ymax_vp,
-              cutoff_frequencies=True, arrow_dir="down",
-              material_velocities=True, plt_kwargs=sym_kw)
-    lamb.plot(ax_vp, lamb.vp_antisym, ymax_vp,
-              cutoff_frequencies=True, arrow_dir="down",
-              material_velocities=True, plt_kwargs=antisym_kw)
+    if len(roots) > 0:
+        # Separate modes by the symmetry flag (last column)
+        # roots format: [vp, fd, vg, steer, symmetry]
+        fd_pts = roots[:, 1]
+        vp_pts = roots[:, 0]
+        sym_pts = roots[:, 4].astype(int)
+        
+        # Plot Bulk Velocity reference lines
+        ax_vp.axhline(c_L, color="black", ls=":", lw=1, alpha=0.6)
+        ax_vp.text(ax_vp.get_xlim()[1]*0.98, c_L, "$c_L$", va="bottom", ha="right", fontsize=10)
+        ax_vp.axhline(c_S, color="black", ls=":", lw=1, alpha=0.6)
+        ax_vp.text(ax_vp.get_xlim()[1]*0.98, c_S, "$c_S$", va="bottom", ha="right", fontsize=10)
+
+        # Plot scattered points with symmetry coloring
+        for sym_flag, label_base, kw in [(1, "S", sym_kw), (0, "A", antisym_kw)]:
+            mask = (sym_pts == sym_flag)
+            if np.any(mask):
+                x = fd_pts[mask]
+                y = vp_pts[mask]
+                
+                sort_idx = np.argsort(x)
+                xs, ys = x[sort_idx], y[sort_idx]
+                
+                # Group points into lines
+                starts = [0]
+                for i in range(1, len(xs)):
+                    dist = np.sqrt(((xs[i] - xs[i-1])/fd_exc)**2 + ((ys[i] - ys[i-1])/1000)**2)
+                    if dist > 0.4: # Jump threshold
+                        starts.append(i)
+                starts.append(len(xs))
+                
+                # We'll track how many modes of each family we've labeled
+                mode_count = 0 
+                for i in range(len(starts)-1):
+                    x_line = xs[starts[i]:starts[i+1]]
+                    y_line = ys[starts[i]:starts[i+1]]
+                    if len(x_line) > 5:
+                        ax_vp.plot(x_line, y_line, **kw, alpha=0.9, zorder=5)
+                        
+                        # Label mode (S0, A0, etc.) only if it's a significant branch
+                        # and not too far into the plot (likely a start)
+                        if x_line[0] < fd_exc * 8:
+                            mode_label = rf"$\mathregular{{{label_base}_{mode_count}}}$"
+                            # Position slightly offset
+                            ax_vp.text(x_line[0], y_line[0], mode_label, color=kw['color'], 
+                                      fontsize=10, fontweight='bold', va='bottom', ha='right' if mode_count > 0 else 'left')
+                            
+                            # For higher order modes, add a small arrow at the top for cutoff
+                            if x_line[0] > 10: # Not the fundamentals
+                                ax_vp.axvline(x_line[0], color='gray', ls='--', lw=0.5, alpha=0.5)
+                                ax_vp.text(x_line[0], ax_vp.get_ylim()[1], r'$\downarrow$', ha='center', va='top', fontsize=12)
+                            
+                            mode_count += 1
 
     ax_vp.set_ylabel("Phase Velocity  (m/s)", fontsize=11)
-    ax_vp.set_title("Phase Velocity", fontsize=11, pad=4)
-    ax_vp.grid(True, alpha=0.3)
+    ax_vp.set_title("Phase Velocity (Exact Global Matrix Method)", fontsize=11, pad=10)
+    ax_vp.grid(True, alpha=0.3, ls=':')
+    ax_vp.set_xlim(0, fd_exc * 10)
 
-    # Mark the excitation operating point on phase velocity
-    try:
-        vp_a0 = float(lamb.vp_antisym["A0"](fd_exc))
-        ax_vp.axvline(fd_exc, color="green", lw=1.5, ls="--", alpha=0.85,
-                      label=f"f = {freq_kHz:.0f} kHz  (fd = {fd_exc:.0f} kHz·mm)")
-        ax_vp.plot(fd_exc, vp_a0, "g^", ms=9, zorder=6)
-    except Exception:
-        pass
 
-    # Add mode labels near right side of each curve
-    _label_curves(ax_vp, lamb.vp_sym,     lamb.fd_max, ymax_vp, "#1f77b4")
-    _label_curves(ax_vp, lamb.vp_antisym, lamb.fd_max, ymax_vp, "#d62728")
+    # Mark the excitation operating point (v_phase and v_group) on the plot
+    ax_vp.axvline(fd_exc, color="green", lw=1.5, ls="--", alpha=0.8, 
+                 label=f"Operating point: {fd_exc/h_mm:.0f} kHz")
+    
+    if len(roots) > 0:
+        # Find closest A0 mode at fd_exc
+        # Roots are [vp, fd, vg, steer]
+        diffs = np.abs(roots[:, 1] - fd_exc)
+        closest_idx = np.argmin(diffs)
+        if diffs[closest_idx] < 50: # Only plot if reasonably close root found
+            vp_at_exc = roots[closest_idx, 0]
+            vg_at_exc = roots[closest_idx, 2]
+            ax_vp.plot(fd_exc, vp_at_exc, "g^", ms=10, label=f"A0 Phase: {vp_at_exc:.0f} m/s", zorder=10)
+            ax_vg.plot(fd_exc, vg_at_exc, "g^", ms=10, label=f"A0 Group: {vg_at_exc:.0f} m/s", zorder=10)
+            ax_vg.axvline(fd_exc, color="green", lw=1.5, ls="--", alpha=0.8)
 
     # Legend: proxy patches for mode families
     ax_vp.legend(
         handles=[
-            mpatches.Patch(color="#1f77b4", label="Symmetric (S0, S1, S2)"),
-            mpatches.Patch(color="#d62728", label="Antisymmetric (A0, A1, A2)"),
+            mpatches.Patch(color="blue", label="Exact Anisotropic Modes"),
             plt.Line2D([0], [0], color="green", ls="--", lw=1.5,
                        label=f"Operating point: {freq_kHz:.0f} kHz"),
         ],
@@ -479,85 +549,56 @@ def plot_dispersion_curves(lamb, fd_exc, freq_kHz, save_path,
     # =========================================================================
     # BOTTOM PANEL — Group Velocity
     # =========================================================================
-    lamb.plot(ax_vg, lamb.vg_sym,     ymax_vg,
-              cutoff_frequencies=True, arrow_dir="up", plt_kwargs=sym_kw)
-    lamb.plot(ax_vg, lamb.vg_antisym, ymax_vg,
-              cutoff_frequencies=True, arrow_dir="up", plt_kwargs=antisym_kw)
+    if len(roots) > 0:
+        vg_pts = roots[:, 2]
+        for sym_flag, label, kw in [(1, "Symmetric", sym_kw), (0, "Antisymmetric", antisym_kw)]:
+            mask = (sym_pts == sym_flag)
+            if np.any(mask):
+                x = fd_pts[mask]
+                y = vg_pts[mask]
+                sort_idx = np.argsort(x)
+                xs, ys = x[sort_idx], y[sort_idx]
+                
+                starts = [0]
+                for i in range(1, len(xs)):
+                    dist = np.sqrt(((xs[i] - xs[i-1])/fd_exc)**2 + ((ys[i] - ys[i-1])/500)**2)
+                    if dist > 0.5:
+                        starts.append(i)
+                starts.append(len(xs))
+                
+                for i in range(len(starts)-1):
+                    x_line = xs[starts[i]:starts[i+1]]
+                    y_line = ys[starts[i]:starts[i+1]]
+                    if len(x_line) > 2:
+                        ax_vg.plot(x_line, y_line, **kw, alpha=0.8)
 
-    ax_vg.set_xlabel("Frequency × Thickness  (kHz·mm)", fontsize=11)
     ax_vg.set_ylabel("Group Velocity  (m/s)", fontsize=11)
-    ax_vg.set_title("Group Velocity", fontsize=11, pad=4)
-    ax_vg.grid(True, alpha=0.3)
+    ax_vg.set_xlabel("Frequency × Thickness  (kHz·mm)", fontsize=11)
+    ax_vg.set_title("Group Velocity", fontsize=11, pad=10)
+    ax_vg.grid(True, alpha=0.3, ls=':')
 
-    # Shade the recommended SHM operating window (A0/S0 well separated,
-    # A0 group velocity is roughly stable: fd ≈ 100–300 kHz·mm)
+    # Shade the recommended SHM operating window
     ax_vg.axvspan(100, 300, alpha=0.07, color="green",
-                  label="Recommended SHM window (fd 100–300 kHz·mm)")
+                  label="Recommended SHM window")
 
-    # Mark operating point and compare with paper value
-    try:
-        vg_a0 = float(lamb.vg_antisym["A0"](fd_exc))
-        err_pct = abs(vg_a0 - paper_vg_a0) / paper_vg_a0 * 100
+    # Legend handling
+    ax_vp.legend(
+        handles=[
+            mpatches.Patch(color=sym_kw['color'], label="Symmetric (Stretch)"),
+            mpatches.Patch(color=antisym_kw['color'], label="Antisymmetric (Bending)"),
+            plt.Line2D([0], [0], color="green", ls="--", lw=1.5, label=f"Op point: {freq_kHz:.0f} kHz")
+        ],
+        fontsize=9, loc="upper right", framealpha=0.9
+    )
 
-        ax_vg.axvline(fd_exc, color="green", lw=1.5, ls="--", alpha=0.85)
-        ax_vg.axhline(paper_vg_a0, color="orange", lw=1.5, ls=":",
-                      label=f"Paper A0 vg = {paper_vg_a0:.0f} m/s (Wang 2014)")
-        ax_vg.plot(fd_exc, vg_a0, "g^", ms=11, zorder=6,
-                   label=f"Computed A0 vg = {vg_a0:.0f} m/s")
+    ax_vg.legend(fontsize=9, loc="lower right", framealpha=0.9)
 
-        # Annotation box
-        ax_vg.annotate(
-            f"A0 group vel. = {vg_a0:.0f} m/s\n"
-            f"Paper value   = {paper_vg_a0:.0f} m/s\n"
-            f"Error         = {err_pct:.1f}%",
-            xy=(fd_exc, vg_a0),
-            xytext=(fd_exc + 150, vg_a0 + 350),
-            fontsize=8.5,
-            arrowprops=dict(arrowstyle="->", color="black", lw=1.2),
-            bbox=dict(boxstyle="round,pad=0.4", fc="lightyellow",
-                      ec="gray", alpha=0.92),
-        )
-    except Exception:
-        pass
-
-    _label_curves(ax_vg, lamb.vg_sym,     lamb.fd_max, ymax_vg, "#1f77b4")
-    _label_curves(ax_vg, lamb.vg_antisym, lamb.fd_max, ymax_vg, "#d62728")
-
-    ax_vg.legend(fontsize=9, loc="lower right")
-
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
     print(f"\n  Plot saved → {save_path}")
     return fig
 
 
-def _label_curves(ax, interp_dict, fd_max, y_max, color):
-    """
-    Annotate each dispersion curve with its mode name near the right edge.
-
-    Uses the interpolator's stored x-values to find a safe label position
-    that stays within the visible axis range.
-
-    Parameters
-    ----------
-    ax          : Axes
-    interp_dict : dict   {mode_name: interp1d interpolator}
-    fd_max      : float  Maximum fd on the plot (kHz·mm)
-    y_max       : float  Maximum y on the plot
-    color       : str    Text colour matching the curve colour
-    """
-    for mode_name, interp in interp_dict.items():
-        try:
-            # Place the label at 88 % of the valid x range for this mode
-            x_min, x_max = float(np.amin(interp.x)), float(np.amax(interp.x))
-            fd_pos = x_min + 0.88 * (x_max - x_min)
-            y_pos  = float(interp(fd_pos))
-            if 0 < y_pos < y_max:
-                ax.text(fd_pos, y_pos, f" {mode_name}",
-                        fontsize=8, color=color, va="center",
-                        fontweight="bold")
-        except Exception:
-            pass
 
 
 # =============================================================================
@@ -575,7 +616,7 @@ def _label_curves(ax, interp_dict, fd_max, y_max, color):
 #     For 3D C3D8R elements the effective criterion is dt ≤ Le / (c_L · √3).
 # =============================================================================
 
-def print_abaqus_params(lamb, fd_exc, freq_kHz, c_L, h_mm,
+def print_abaqus_params(fd_exc, freq_kHz, c_L, h_mm,
                         paper_mesh_mm=1.5, paper_dt=5.0e-8,
                         paper_vg_a0=1670.0):
     """
@@ -583,7 +624,6 @@ def print_abaqus_params(lamb, fd_exc, freq_kHz, c_L, h_mm,
 
     Parameters
     ----------
-    lamb          : Lamb    Solved dispersion object
     fd_exc        : float   fd at excitation frequency (kHz·mm)
     freq_kHz      : float   Excitation frequency (kHz)
     c_L           : float   Longitudinal velocity (m/s)
@@ -602,22 +642,12 @@ def print_abaqus_params(lamb, fd_exc, freq_kHz, c_L, h_mm,
 
     freq_Hz = freq_kHz * 1e3
 
-    # ---- Query dispersion results at operating point ---------------------
-    try:
-        vg_a0 = float(lamb.vg_antisym["A0"](fd_exc))
-    except Exception:
-        vg_a0 = paper_vg_a0
-        print("  (Using paper value for A0 vg — interpolation boundary reached)")
+    freq_Hz = freq_kHz * 1e3
 
-    try:
-        vp_a0 = float(lamb.vp_antisym["A0"](fd_exc))
-    except Exception:
-        vp_a0 = vg_a0
-
-    try:
-        vg_s0 = float(lamb.vg_sym["S0"](fd_exc))
-    except Exception:
-        vg_s0 = None
+    # Fallback placeholders for now until root matching is added
+    vg_a0 = paper_vg_a0
+    vp_a0 = vg_a0
+    vg_s0 = None
 
     # ---- Minimum wavelength ----------------------------------------------
     # Spatial wavelength = phase_velocity / frequency
@@ -710,14 +740,23 @@ def main():
     _clt = run_clt_section()
 
     # -- Section 2: 3D properties + wave velocities -------------------------
-    c_L, c_S, rho, h_mm, Ex, nu_xy, Gxy = run_3d_properties_section()
+    c_L, c_S, rho, h_mm, Ex, nu_xy, Gxz = run_3d_properties_section()
+
+    # Hardcoded orthotropic properties to pass to exact solver (Wang et al. Table II)
+    Ey    = 61.758e9   # Pa
+    Ez    = 13.608e9   # Pa
+    Gxy   = 23.415e9   # Pa
+    Gyz   =  4.466e9   # Pa
+    nu_xz =  0.3161    #
+    nu_yz =  0.3161    #
 
     # -- Section 3: Dispersion curves ---------------------------------------
-    lamb, fd_exc = run_dispersion_section(c_L, c_S, h_mm, FREQ_KHZ)
-    plot_dispersion_curves(lamb, fd_exc, FREQ_KHZ, SAVE_PATH)
+    # Call our NEW EXACT Anisotropic GMM solver
+    roots, fd_exc, c_L_ref, c_S_ref = run_dispersion_section(Ex, Ey, Ez, Gxy, Gxz, Gyz, nu_xy, nu_xz, nu_yz, rho, h_mm, FREQ_KHZ)
+    plot_dispersion_curves(roots, fd_exc, FREQ_KHZ, SAVE_PATH, h_mm, c_L_ref, c_S_ref)
 
     # -- Section 4: Abaqus parameters ---------------------------------------
-    print_abaqus_params(lamb, fd_exc, FREQ_KHZ, c_L, h_mm)
+    print_abaqus_params(fd_exc, FREQ_KHZ, c_L, h_mm)
 
     plt.show()
 

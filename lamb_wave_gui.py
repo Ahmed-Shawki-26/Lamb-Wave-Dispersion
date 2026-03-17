@@ -20,7 +20,16 @@ import os
 import shutil
 import threading
 import webbrowser
+import datetime
 import numpy as np
+
+# Import our custom theory engine
+from core.theory_engine import (
+    homogenize_laminate_backus, extract_cL_cS_for_direction,
+    extract_velocities_polar, get_christoffel_full,
+    compute_directional_dispersion, parse_layup,
+)
+from core.abaqus_engine import AbaqusEngine
 
 # Matplotlib — Agg backend so plt.show() is a no-op (must be before pyplot)
 import matplotlib
@@ -111,6 +120,14 @@ TIPS = {
         "  • From the prepreg data sheet (sometimes listed as G_LT or G_12).\n"
         "  • Typical CFRP range: 4 – 8 GPa.\n"
         "  • Matrix-dominated property."
+    ),
+    "G23": (
+        "Out-of-plane shear modulus  [GPa]\n\n"
+        "What it is:\n"
+        "  Shear modulus in the 2-3 plane (perpendicular to fibers).\n"
+        "  Crucial for accurate Christoffel bulk velocity calculations.\n\n"
+        "Typical CFRP range: 3.0 – 4.5 GPa.\n"
+        "Estimate: If unknown, assume 2-3 plane is isotropic: G23 = E2 / (2*(1+nu23))."
     ),
     "nu12": (
         "Major Poisson's ratio  (dimensionless)\n\n"
@@ -221,6 +238,18 @@ TIPS = {
         "  • Part of the output file name  (e.g. T300_5208_plate_1mm.txt).\n\n"
         "Leave blank for 'custom'."
     ),
+    "layup": (
+        "Laminate stacking sequence (e.g., [0/45/90]s or 0,45,90,90,45,0)\n\n"
+        "Format:\n"
+        "  • Standard notation: [0/45/90]s means 0, 45, 90, 90, 45, 0.\n"
+        "  • Simple list: 0, 90, 0, 90.\n"
+        "  • The Christoffel/Backus engine uses this to compute the 'Whole Material' properties."
+    ),
+    "theta": (
+        "Wave propagation angle relative to the 0° (fiber) direction  [degrees]\n\n"
+        "Setting this to 45° will calculate the exact wave speeds for a sensor\n"
+        "pointed at 45 degrees across the plate."
+    ),
     # ---- Abaqus inputs -----------------------------------------------------
     "freq": (
         "Excitation frequency  [kHz]\n\n"
@@ -299,6 +328,25 @@ TIPS = {
         "Plate width  (Y direction)  [mm]\n\n"
         "Same guidance as Plate L.  For a square plate set L = W."
     ),
+    # ---- Bulk / Christoffel Result Tips -----------------------------------
+    "c_qP":  "qP: Quasi-Longitudinal bulk wave. Particles move mostly parallel to wave direction.",
+    "c_qSH": "qSH: Quasi-Shear Horizontal. Particles move in-plane, perpendicular to direction. Critical for S0 Lamb mode.",
+    "c_qSV": "qSV: Quasi-Shear Vertical. Particles move out-of-plane. Critical for A0 Lamb mode.",
+    "iso_P": "Isotropic P-wave: Speed if the material fibers were completely random/unaligned.",
+    "iso_S": "Isotropic S-wave: Shear speed for a random fiber orientation.",
+    "vg_qP": "Group Velocity: The speed of energy transport (the pulse itself).",
+    "vg_qSH": "Group Velocity for SH wave. Often used to predict pulse windowing in Abaqus.",
+    "vg_qSV": "Group Velocity for SV wave.",
+    "pf_qP":  "Powerflow Angle: Deviation angle between the way you wave 'looks' and where the energy travels.",
+    "pf_qSH": "SH Powerflow: Shows how much energy 'skews' away from the sensor at this angle.",
+    "pf_qSV": "SV Powerflow.",
+    "clt_hint": (
+        "Classic CLT (Classical Laminate Theory)\n\n"
+        "NOTE: This method assumes the laminate is Quasi-Isotropic.\n"
+        "It uses in-plane invariants to calculate equivalent bulk speeds.\n"
+        "For strongly anisotropic or non-symmetric layups, results will be approximate."
+    ),
+    "adv_wip": "Advanced Christoffel solver is currently under development.",
 }
 
 
@@ -311,8 +359,9 @@ def add_tip(widget, key):
 # Paths
 # ---------------------------------------------------------------------------
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-# When run from inside this repo, script dir is the repo root (contains lambwaves/)
-LWD_PATH    = SCRIPT_DIR
+# The project root should be in sys.path
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
 
 def _safe_folder_name(mat_name, thickness, c_L=None):
@@ -328,21 +377,19 @@ def _safe_folder_name(mat_name, thickness, c_L=None):
             pass
     return "_".join(parts)
 
-if LWD_PATH not in sys.path:
-    sys.path.insert(0, LWD_PATH)
-
+# Ensure results directory exists
 os.makedirs(RESULTS_DIR, exist_ok=True)
-os.chdir(SCRIPT_DIR)   # library saves to ./results/ relative to CWD
+os.chdir(SCRIPT_DIR)
 
-from lambwaves import Lamb   # noqa: E402  (import after path setup)
+from core.lambwaves import Lamb   # noqa: E402  (import after path setup)
 
 # ---------------------------------------------------------------------------
 # Material presets  (from PROJECT_GUIDE.md §3)
 # ---------------------------------------------------------------------------
 PRESETS = {
-    "T300/5208":  {"E1": 132.0, "E2": 10.8, "G12": 5.65, "nu12": 0.24, "rho": 1520, "thickness": 1.0},
-    "T300/914":   {"E1": 138.0, "E2": 11.0, "G12": 5.5,  "nu12": 0.28, "rho": 1550, "thickness": 1.0},
-    "AS4/3501-6": {"E1": 148.0, "E2": 10.5, "G12": 5.61, "nu12": 0.30, "rho": 1540, "thickness": 1.0},
+    "T300/5208":  {"E1": 132.0, "E2": 10.8, "G12": 5.65, "G23": 3.38, "nu12": 0.24, "rho": 1520, "thickness": 1.0, "layup": "[0/45/-45/90]s"},
+    "T300/914":   {"E1": 138.0, "E2": 11.0, "G12": 5.5,  "G23": 3.93, "nu12": 0.28, "rho": 1550, "thickness": 1.0, "layup": "[0/45/-45/90]s"},
+    "AS4/3501-6": {"E1": 148.0, "E2": 10.5, "G12": 5.61, "G23": 3.17, "nu12": 0.30, "rho": 1540, "thickness": 1.0, "layup": "[0/45/-45/90]s"},
 }
 
 # ---------------------------------------------------------------------------
@@ -364,8 +411,7 @@ def clt_velocities(E1_GPa, E2_GPa, G12_GPa, nu12, rho):
     return round(c_L), round(c_S), round(c_R)
 
 # ---------------------------------------------------------------------------
-# Animation data builder  (reused from animate_lamb_wave.py)
-# ---------------------------------------------------------------------------
+# Helper: build_anim_data (reused from animate_lamb_wave.py)
 def build_anim_data(lamb_obj, mode, vp, fd):
     d = lamb_obj.d;  h = lamb_obj.h
     freq_hz = (fd / d) * 1e3
@@ -402,6 +448,7 @@ class App(tk.Tk):
         self._anti_col  = "#d62728"
         self._figs      = {}        # {key: fig} — track open figures for cleanup
         self._abq_params = None     # computed Abaqus parameters dict
+        self._added_damages = []    # List of dicts for multi-damage
 
         self._build_ui()
 
@@ -427,7 +474,9 @@ class App(tk.Tk):
         self.tab_wstr  = ttk.Frame(self.nb); self.nb.add(self.tab_wstr,  text="  Wave Structure  ")
         self.tab_anim  = ttk.Frame(self.nb); self.nb.add(self.tab_anim,  text="  Animation  ")
         self.tab_abq   = ttk.Frame(self.nb); self.nb.add(self.tab_abq,   text="  Abaqus Parameters  ")
+        self.tab_fea   = ttk.Frame(self.nb); self.nb.add(self.tab_fea,   text="  Abaqus Script Generator  ")
         self.tab_exp   = ttk.Frame(self.nb); self.nb.add(self.tab_exp,   text="  Export  ")
+        self.tab_theory = ttk.Frame(self.nb); self.nb.add(self.tab_theory, text="  Scientific Theory  ")
         self.tab_help  = ttk.Frame(self.nb); self.nb.add(self.tab_help,  text="  Help / Guide  ")
 
         self._build_setup()
@@ -435,7 +484,9 @@ class App(tk.Tk):
         self._build_wave_structure()
         self._build_animation()
         self._build_abaqus()
+        self._build_abaqus_fea()
         self._build_export()
+        self._build_theory()
         self._build_help()
 
     # =======================================================================
@@ -460,7 +511,7 @@ class App(tk.Tk):
         cols = ttk.Frame(p)
         cols.pack(fill="both", expand=True, padx=10, pady=4)
 
-        left  = ttk.LabelFrame(cols, text="Ply Properties  +  Wave Velocities  [0/45/-45/90]s")
+        left  = ttk.LabelFrame(cols, text="Material Modeling  (Ply + Layup)")
         right = ttk.LabelFrame(cols, text="Solver Settings")
         left.pack(side="left",  fill="both", expand=True, padx=(0, 6))
         right.pack(side="left", fill="both", expand=True, padx=(6, 0))
@@ -470,6 +521,7 @@ class App(tk.Tk):
             ("E1   (GPa)  (?)",      "e1",        "E1"),
             ("E2   (GPa)  (?)",      "e2",        "E2"),
             ("G12  (GPa)  (?)",      "g12",       "G12"),
+            ("G23  (GPa)  (?)",      "g23",       "G23"),
             ("ν12          (?)",     "nu12",      "nu12"),
             ("ρ    (kg/m³)  (?)",    "rho",       "rho"),
             ("Thickness  (mm)  (?)", "thickness", "thickness"),
@@ -485,9 +537,28 @@ class App(tk.Tk):
 
         ttk.Separator(left, orient="horizontal").grid(
             row=len(prop_defs), column=0, columnspan=2, sticky="ew", padx=8, pady=6)
-        ttk.Button(left, text="Compute  c_L / c_S / c_R  (CLT)",
-                   command=self._compute_vel
-                   ).grid(row=len(prop_defs)+1, column=0, columnspan=2, padx=10, pady=4)
+        
+        # Layup and Angle
+        ttk.Label(left, text="Layup (e.g. [0/45/90]s) (?)", foreground="#1a73e8", cursor="question_arrow").grid(row=len(prop_defs)+1, column=0, sticky="w", padx=10, pady=2)
+        add_tip(left.grid_slaves(row=len(prop_defs)+1, column=0)[0], "layup")
+        self._pv["layup"] = tk.StringVar(value="[0/45/-45/90]s")
+        ttk.Entry(left, textvariable=self._pv["layup"], width=14).grid(row=len(prop_defs)+1, column=1, padx=10, pady=2)
+
+        ttk.Label(left, text="Prop. Angle (deg) (?)", foreground="#1a73e8", cursor="question_arrow").grid(row=len(prop_defs)+2, column=0, sticky="w", padx=10, pady=2)
+        add_tip(left.grid_slaves(row=len(prop_defs)+2, column=0)[0], "theta")
+        self._pv["theta"] = tk.StringVar(value="0")
+        ttk.Entry(left, textvariable=self._pv["theta"], width=14).grid(row=len(prop_defs)+2, column=1, padx=10, pady=2)
+
+        btn_f = ttk.Frame(left)
+        btn_f.grid(row=len(prop_defs)+3, column=0, columnspan=2, pady=10)
+        clt_btn = ttk.Button(btn_f, text="Classic CLT", command=self._compute_vel)
+        clt_btn.pack(side="left", padx=5)
+        add_tip(clt_btn, "clt_hint")
+        ttk.Label(btn_f, text="(For Quasi-Isotropic Only)", foreground="#d62728", font=("", 8)).pack(side="left", padx=2)
+        
+        adv_btn = ttk.Button(btn_f, text="Advanced Christoffel (WIP)", command=self._compute_christoffel_vel, state="disabled")
+        adv_btn.pack(side="left", padx=5)
+        add_tip(adv_btn, "adv_wip")
 
         vel_defs = [
             ("c_L  (m/s)  (?)", "cL", "cL"),
@@ -495,7 +566,7 @@ class App(tk.Tk):
             ("c_R  (m/s)  (?)", "cR", "cR"),
         ]
         self._vv = {}
-        base = len(prop_defs) + 2
+        base = len(prop_defs) + 4
         for i, (lbl, key, tip_key) in enumerate(vel_defs):
             lw = ttk.Label(left, text=lbl, foreground="#1a73e8", cursor="question_arrow")
             lw.grid(row=base+i, column=0, sticky="w", padx=10, pady=5)
@@ -503,9 +574,9 @@ class App(tk.Tk):
             v = tk.StringVar()
             ttk.Entry(left, textvariable=v, width=14).grid(row=base+i, column=1, padx=10, pady=5)
             self._vv[key] = v
-        ttk.Label(left, text="(c_R is optional — leave blank to skip)",
+        ttk.Label(left, text="(Christoffel ignores c_R; uses Backus homogenization)",
                   foreground="#888", font=("", 8)
-                  ).grid(row=base+3, column=0, columnspan=2, padx=10, sticky="w")
+                  ).grid(row=base+len(vel_defs), column=0, columnspan=2, padx=10, sticky="w")
 
         # --- Right: solver settings ---
         solver_defs = [
@@ -529,6 +600,52 @@ class App(tk.Tk):
         ttk.Label(right, text="\nTip: fd_max = max_frequency × thickness.\nFor 50 kHz on a 1 mm plate → fd = 50.\n5000 gives plenty of modes for analysis.",
                   foreground="#666", font=("", 8), justify="left"
                   ).grid(row=len(solver_defs), column=0, columnspan=2, padx=10, sticky="w")
+
+        # --- Christoffel Analysis Results panel ---
+        chris_res_f = ttk.LabelFrame(p, text="Christoffel Analysis Results  (populated after clicking 'Advanced Christoffel')")
+        chris_res_f.pack(fill="x", padx=10, pady=(0, 4))
+
+        self._crv = {}
+        _chris_layout = [
+            # Row 0 — Phase velocities
+            [("qP Phase vel. (m/s)",  "c_qP"),
+             ("qSH Phase vel. (m/s)", "c_qSH"),
+             ("qSV Phase vel. (m/s)", "c_qSV"),
+             ("Isotropic P (m/s)",    "iso_P")],
+            # Row 1 — Group velocities + isotropic S
+            [("qP Group vel. (m/s)",  "vg_qP"),
+             ("qSH Group vel. (m/s)", "vg_qSH"),
+             ("qSV Group vel. (m/s)", "vg_qSV"),
+             ("Isotropic S (m/s)",    "iso_S")],
+            # Row 2 — Powerflow angles
+            [("qP Powerflow (°)",  "pf_qP"),
+             ("qSH Powerflow (°)", "pf_qSH"),
+             ("qSV Powerflow (°)", "pf_qSV"),
+             None],
+        ]
+        for row_idx, row_items in enumerate(_chris_layout):
+            for col_idx, item in enumerate(row_items):
+                if item is None:
+                    continue
+                lbl_text, key = item
+                lw = ttk.Label(
+                    chris_res_f, text=lbl_text + ":",
+                    foreground="#1a73e8", font=("", 8), cursor="question_arrow"
+                )
+                lw.grid(row=row_idx, column=col_idx * 2, sticky="e", padx=(12, 2), pady=3)
+                add_tip(lw, key) # Using the key as the tooltip lookup
+                v = tk.StringVar(value="—")
+                ttk.Label(
+                    chris_res_f, textvariable=v,
+                    foreground="#1a73e8", font=("Consolas", 9), width=9
+                ).grid(row=row_idx, column=col_idx * 2 + 1, sticky="w", padx=(0, 10), pady=3)
+                self._crv[key] = v
+
+        ttk.Button(
+            chris_res_f, text="Polar Velocity Plot (WIP)",
+            command=self._plot_christoffel_polar,
+            state="disabled"
+        ).grid(row=3, column=0, columnspan=8, pady=(4, 6))
 
         # Solve row
         bf = ttk.Frame(p)
@@ -584,6 +701,31 @@ class App(tk.Tk):
                                      command=lambda: self._pick_color("anti"))
         self._sym_btn.pack(side="left", padx=4, pady=4)
         self._anti_btn.pack(side="left", padx=4, pady=4)
+
+        # --- Directional Dispersion (Anisotropic) ---
+        ddf = ttk.LabelFrame(p, text="Directional Dispersion  (Christoffel quasi-isotropic approximation)")
+        ddf.pack(fill="x", padx=10, pady=(0, 4))
+
+        ttk.Label(ddf, text="Angle step (°):").grid(row=0, column=0, padx=(10, 2), pady=6, sticky="e")
+        self._dd_step = tk.StringVar(value="10")
+        ttk.Entry(ddf, textvariable=self._dd_step, width=6).grid(row=0, column=1, padx=(0, 12), pady=6)
+
+        ttk.Label(ddf, text="fd for polar (kHz·mm):").grid(row=0, column=2, padx=(4, 2), pady=6, sticky="e")
+        self._dd_fd = tk.StringVar(value="50")
+        ttk.Entry(ddf, textvariable=self._dd_fd, width=8).grid(row=0, column=3, padx=(0, 12), pady=6)
+
+        ttk.Button(
+            ddf, text="Plot Directional Dispersion (WIP)",
+            command=self._plot_directional_dispersion,
+            state="disabled"
+        ).grid(row=0, column=4, padx=8, pady=6)
+
+        ttk.Label(
+            ddf,
+            text="Requires G23 + Layup filled in Setup. Uses Christoffel cL(θ), cS(θ) → Rayleigh-Lamb at each angle. "
+                 "Accurate for quasi-isotropic laminates; approximate for strongly anisotropic layups.",
+            foreground="#888", font=("", 8), wraplength=780, justify="left"
+        ).grid(row=1, column=0, columnspan=6, padx=10, pady=(0, 6), sticky="w")
 
         # Canvas area
         self._df = ttk.Frame(p)
@@ -707,21 +849,35 @@ class App(tk.Tk):
         self._pv["e1"].set(str(d["E1"]))
         self._pv["e2"].set(str(d["E2"]))
         self._pv["g12"].set(str(d["G12"]))
+        self._pv["g23"].set(str(d.get("G23", "")))
         self._pv["nu12"].set(str(d["nu12"]))
         self._pv["rho"].set(str(d["rho"]))
         self._pv["thickness"].set(str(d["thickness"]))
+        self._pv["layup"].set(d.get("layup", "[0/45/-45/90]s"))
+        self._pv["theta"].set("0")
         self._sv["mat_name"].set(name)
         self._compute_vel()
 
     def _clear_fields(self):
-        for v in self._pv.values():
-            v.set("")
+        for k, v in self._pv.items():
+            if k == "layup":
+                v.set("[0]8")
+            elif k == "theta":
+                v.set("0")
+            else:
+                v.set("")
         for v in self._vv.values():
             v.set("")
         self._sv["mat_name"].set("")
 
     def _compute_vel(self):
         try:
+            # Check for empty fields first
+            for key in ["e1", "e2", "g12", "nu12", "rho"]:
+                if not self._pv[key].get().strip():
+                    messagebox.showwarning("Missing Data", f"Please fill the '{key.upper()}' field.")
+                    return
+
             cL, cS, cR = clt_velocities(
                 float(self._pv["e1"].get()),
                 float(self._pv["e2"].get()),
@@ -729,11 +885,312 @@ class App(tk.Tk):
                 float(self._pv["nu12"].get()),
                 float(self._pv["rho"].get()),
             )
-            self._vv["cL"].set(str(cL))
-            self._vv["cS"].set(str(cS))
-            self._vv["cR"].set(str(cR))
+            self._vv["cL"].set(f"{cL:.0f}")
+            self._vv["cS"].set(f"{cS:.0f}")
+            self._vv["cR"].set(f"{cR:.0f}")
         except ValueError as e:
-            messagebox.showerror("Input Error", f"Bad material property:\n{e}")
+            messagebox.showerror("Input Error", f"Could not parse numeric input:\n{e}")
+
+    def _compute_christoffel_vel(self):
+        try:
+            req = {
+                "e1": "E1", "e2": "E2", "g12": "G12", "g23": "G23",
+                "nu12": "nu12", "rho": "rho", "theta": "Angle", "layup": "Layup"
+            }
+            for key, name in req.items():
+                if not self._pv[key].get().strip():
+                    messagebox.showwarning("Missing Data", f"Please fill the '{name}' field.")
+                    return
+
+            E1   = float(self._pv["e1"].get())   * 1e9
+            E2   = float(self._pv["e2"].get())   * 1e9
+            G12  = float(self._pv["g12"].get())  * 1e9
+            G23  = float(self._pv["g23"].get())  * 1e9
+            nu12 = float(self._pv["nu12"].get())
+            rho  = float(self._pv["rho"].get())
+            theta = float(self._pv["theta"].get())
+            layup_str = self._pv["layup"].get()
+
+            angles = parse_layup(layup_str)
+            thicknesses = [1.0] * len(angles)
+
+            C_eff = homogenize_laminate_backus(E1, E2, G12, G23, nu12, angles, thicknesses)
+            res   = get_christoffel_full(C_eff, rho, theta)
+
+            # Fill main velocity fields used by SOLVE
+            # c_S = c_qSV (interlaminar/through-thickness shear) — correct for Lamb P-SV coupling
+            self._vv["cL"].set(f"{res['c_qP']:.0f}")
+            self._vv["cS"].set(f"{res['c_qSV']:.0f}")
+            self._vv["cR"].set("")
+
+            # Populate Christoffel results panel
+            for key in ("c_qP", "c_qSH", "c_qSV",
+                        "vg_qP", "vg_qSH", "vg_qSV",
+                        "pf_qP", "pf_qSH", "pf_qSV",
+                        "iso_P", "iso_S"):
+                val = res[key]
+                if key.startswith("pf_"):
+                    self._crv[key].set(f"{val:.2f}°")
+                else:
+                    self._crv[key].set(f"{val:.0f}")
+
+            self._status.set(
+                f"Christoffel solved at θ={theta}°  →  "
+                f"c_qP={res['c_qP']:.0f} m/s,  "
+                f"c_qSH={res['c_qSH']:.0f} m/s,  "
+                f"c_qSV={res['c_qSV']:.0f} m/s"
+            )
+
+        except Exception as e:
+            messagebox.showerror("Christoffel Error", f"Error during anisotropic calculation:\n{e}")
+
+    def _plot_christoffel_polar(self):
+        """Generate polar plots of c_qP(θ) and c_qSH(θ) using Christoffel + Backus."""
+        try:
+            req = {"e1": "E1", "e2": "E2", "g12": "G12", "g23": "G23",
+                   "nu12": "nu12", "rho": "rho", "layup": "Layup"}
+            for key, name in req.items():
+                if not self._pv[key].get().strip():
+                    messagebox.showwarning("Missing Data", f"Please fill the '{name}' field.")
+                    return
+
+            E1   = float(self._pv["e1"].get())   * 1e9
+            E2   = float(self._pv["e2"].get())   * 1e9
+            G12  = float(self._pv["g12"].get())  * 1e9
+            G23  = float(self._pv["g23"].get())  * 1e9
+            nu12 = float(self._pv["nu12"].get())
+            rho  = float(self._pv["rho"].get())
+            layup_str = self._pv["layup"].get()
+
+            angles_layup = parse_layup(layup_str)
+            thicknesses  = [1.0] * len(angles_layup)
+            C_eff = homogenize_laminate_backus(E1, E2, G12, G23, nu12, angles_layup, thicknesses)
+
+            thetas_deg = np.linspace(0, 360, 73)   # 5° steps, full rotation
+            cL_arr, cS_arr = extract_velocities_polar(C_eff, rho, thetas_deg)
+            theta_rad = np.radians(thetas_deg)
+
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5),
+                                     subplot_kw={"projection": "polar"})
+            for ax, vals, title, color in zip(
+                axes,
+                [cL_arr / 1000.0, cS_arr / 1000.0],
+                ["Quasi-P  c_qP(θ)  [km/s]", "Quasi-SH  c_qSH(θ)  [km/s]"],
+                ["#1f77b4", "#d62728"],
+            ):
+                ax.plot(theta_rad, vals, color=color, lw=2)
+                ax.fill(theta_rad, vals, alpha=0.10, color=color)
+                ax.set_title(title, pad=14)
+                ax.grid(True, alpha=0.4)
+
+            mat = self._sv["mat_name"].get().strip() or "custom"
+            fig.suptitle(f"Bulk Velocity Anisotropy — {mat}  {layup_str}", fontsize=11)
+            fig.tight_layout()
+
+            # Open in a Toplevel window
+            win = tk.Toplevel(self)
+            win.title("Christoffel Polar Velocity Plot")
+            win.geometry("900x520")
+            canvas = FigureCanvasTkAgg(fig, master=win)
+            tb = NavigationToolbar2Tk(canvas, win, pack_toolbar=False)
+            tb.pack(side="bottom", fill="x")
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            canvas.draw()
+
+            # Save PNG
+            out = self.get_material_output_dir()
+            fpath = os.path.join(out, "christoffel_polar.png")
+            fig.savefig(fpath, dpi=150, bbox_inches="tight")
+            self._log(f"Christoffel polar plot saved → {fpath}")
+
+        except Exception as e:
+            messagebox.showerror("Polar Plot Error", f"Error generating polar plot:\n{e}")
+
+    def _plot_directional_dispersion(self):
+        """
+        Sweep propagation angle, run Christoffel+Rayleigh-Lamb at each angle,
+        and produce corrected phase/group polar plots following Neau et al. (2001):
+          - Phase velocity plotted at PHASE angle (correct as-is)
+          - Group velocity plotted at GROUP angle = phase angle + Christoffel powerflow angle
+          - Steering angle polar shows the bulk-wave powerflow angles vs phase angle
+        """
+        try:
+            req = {"e1": "E1", "e2": "E2", "g12": "G12", "g23": "G23",
+                   "nu12": "nu12", "rho": "rho", "layup": "Layup",
+                   "thickness": "Thickness"}
+            for key, name in req.items():
+                if not self._pv[key].get().strip():
+                    messagebox.showwarning("Missing Data", f"Please fill the '{name}' field in Setup.")
+                    return
+
+            E1   = float(self._pv["e1"].get())   * 1e9
+            E2   = float(self._pv["e2"].get())   * 1e9
+            G12  = float(self._pv["g12"].get())  * 1e9
+            G23  = float(self._pv["g23"].get())  * 1e9
+            nu12 = float(self._pv["nu12"].get())
+            rho  = float(self._pv["rho"].get())
+            thickness_mm = float(self._pv["thickness"].get())
+            layup_str    = self._pv["layup"].get()
+            angle_step   = float(self._dd_step.get())
+            fd_polar     = float(self._dd_fd.get())
+
+            if angle_step <= 0 or angle_step > 90:
+                messagebox.showerror("Input Error", "Angle step must be between 1 and 90 degrees.")
+                return
+
+            angles_layup = parse_layup(layup_str)
+            thicknesses  = [1.0] * len(angles_layup)
+            C_eff = homogenize_laminate_backus(E1, E2, G12, G23, nu12, angles_layup, thicknesses)
+
+            thetas = np.arange(0, 360 + angle_step * 0.5, angle_step)
+            mat    = self._sv["mat_name"].get().strip() or "custom"
+
+            self._status.set("Running directional dispersion sweep…  please wait")
+            self.update_idletasks()
+
+            data = compute_directional_dispersion(
+                C_eff, rho, thickness_mm,
+                fd_max         = float(self._sv["fd_max"].get()),
+                thetas_deg     = thetas,
+                nmodes_sym     = int(self._sv["nmodes_sym"].get()),
+                nmodes_antisym = int(self._sv["nmodes_antisym"].get()),
+                vp_max         = float(self._sv["vp_max"].get()),
+                fd_points      = int(self._sv["fd_points"].get()),
+                vp_step        = int(self._sv["vp_step"].get()),
+            )
+
+            fd_arr   = data['fd']
+            fd_idx   = int(np.argmin(np.abs(fd_arr - fd_polar)))
+            fd_actual = fd_arr[fd_idx]
+
+            # ---- Collect polar slice data at fd_polar ----
+            phase_rad   = np.radians(thetas)
+
+            A0_vp_polar = np.array([r['A0_vp'][fd_idx] for r in data['results']])
+            A0_vg_polar = np.array([r['A0_vg'][fd_idx] for r in data['results']])
+            S0_vp_polar = np.array([r['S0_vp'][fd_idx] for r in data['results']])
+            S0_vg_polar = np.array([r['S0_vg'][fd_idx] for r in data['results']])
+
+            # Christoffel bulk-wave powerflow (steering) angles per phase direction — SIGNED
+            # A0 ≈ qSV at low fd;  S0 ≈ qP at low fd  (Neau et al. 2001 correspondence)
+            # Use signed angles so CCW/CW bending is correctly represented in polar plot
+            pf_A0_deg = np.array([r.get('pf_qSV_signed', r['pf_qSV']) for r in data['results']])
+            pf_S0_deg = np.array([r.get('pf_qP_signed',  r['pf_qP'])  for r in data['results']])
+            pf_qP_deg = pf_S0_deg   # alias for steering angle polar
+
+            # GROUP angle = phase angle + signed steering angle (Neau et al. 2001, Fig. 4b)
+            group_rad_A0 = np.radians(thetas + pf_A0_deg)
+            group_rad_S0 = np.radians(thetas + pf_S0_deg)
+
+            # ---- Figure layout: 3 rows ----
+            # Row 1: Phase velocity polar (A0, S0)  — plotted at phase angle
+            # Row 2: Group velocity polar (A0, S0)  — plotted at GROUP angle (corrected)
+            # Row 3: Steering angle polar + vp(fd) line plots
+            fig = plt.figure(figsize=(14, 13))
+            fig.suptitle(
+                f"Directional Dispersion  —  {mat}  {layup_str}\n"
+                f"Phase vel. at phase angle θ  |  Group vel. at group angle φ = θ + steering  "
+                f"|  fd = {fd_actual:.0f} kHz·mm",
+                fontsize=10
+            )
+
+            # Row 1: phase velocity polars
+            ax_A0p = fig.add_subplot(3, 4, 1, projection="polar")
+            ax_S0p = fig.add_subplot(3, 4, 2, projection="polar")
+
+            for ax, vals, title, color in [
+                (ax_A0p, A0_vp_polar,
+                 f"A0  Phase vel. (m/s)\nvs PHASE angle θ", "#d62728"),
+                (ax_S0p, S0_vp_polar,
+                 f"S0  Phase vel. (m/s)\nvs PHASE angle θ", "#1f77b4"),
+            ]:
+                mask = ~np.isnan(vals)
+                if mask.any():
+                    ax.plot(phase_rad[mask], vals[mask], color=color, lw=2)
+                    ax.fill(phase_rad[mask], vals[mask], alpha=0.12, color=color)
+                ax.set_title(title, pad=10, fontsize=8)
+                ax.grid(True, alpha=0.4)
+
+            # Row 2: group velocity polars at GROUP angle
+            ax_A0g = fig.add_subplot(3, 4, 5, projection="polar")
+            ax_S0g = fig.add_subplot(3, 4, 6, projection="polar")
+
+            for ax, vals, group_rad, title, color in [
+                (ax_A0g, A0_vg_polar, group_rad_A0,
+                 f"A0  Group vel. (m/s)\nvs GROUP angle φ  (corrected)", "#d62728"),
+                (ax_S0g, S0_vg_polar, group_rad_S0,
+                 f"S0  Group vel. (m/s)\nvs GROUP angle φ  (corrected)", "#1f77b4"),
+            ]:
+                mask = ~np.isnan(vals)
+                if mask.any():
+                    ax.plot(group_rad[mask], vals[mask], color=color, lw=2)
+                    ax.fill(group_rad[mask], vals[mask], alpha=0.12, color=color)
+                ax.set_title(title, pad=10, fontsize=8)
+                ax.grid(True, alpha=0.4)
+
+            # Row 3 left: steering angle polar
+            ax_steer = fig.add_subplot(3, 4, 9, projection="polar")
+            ax_steer.plot(phase_rad, pf_qP_deg,  color="#1f77b4", lw=2, label="qP (S0)")
+            ax_steer.plot(phase_rad, pf_A0_deg,  color="#d62728", lw=2, label="qSV (A0)")
+            ax_steer.set_title(
+                "Steering angle (°)\nvs phase angle\n(bulk-wave estimate)", pad=10, fontsize=8)
+            ax_steer.legend(loc="upper right", fontsize=7, bbox_to_anchor=(1.3, 1.1))
+            ax_steer.grid(True, alpha=0.4)
+
+            # Row 3 right: vp(fd) at 0, 45, 90
+            ref_thetas = [0, 45, 90]
+            ref_colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+
+            ax_A0fd = fig.add_subplot(3, 2, 5)
+            ax_S0fd = fig.add_subplot(3, 2, 6)
+
+            for ax, vp_key, title in [
+                (ax_A0fd, 'A0_vp', "A0 Phase Velocity  vp(fd)"),
+                (ax_S0fd, 'S0_vp', "S0 Phase Velocity  vp(fd)"),
+            ]:
+                for ref_th, col in zip(ref_thetas, ref_colors):
+                    idx_th = int(np.argmin(np.abs(thetas - ref_th)))
+                    r = data['results'][idx_th]
+                    vp_vals = r[vp_key]
+                    mask = ~np.isnan(vp_vals)
+                    if mask.any():
+                        ax.plot(fd_arr[mask], vp_vals[mask], color=col, lw=1.5,
+                                label=f"θ={r['theta']:.0f}°")
+                ax.axvline(fd_polar, color="#888", lw=1, ls="--", label=f"fd={fd_polar}")
+                ax.set_xlabel("fd  (kHz·mm)")
+                ax.set_ylabel("Phase velocity  (m/s)")
+                ax.set_title(title, fontsize=9)
+                ax.legend(fontsize=8)
+                ax.grid(True, alpha=0.3)
+
+            fig.text(
+                0.5, 0.01,
+                "Steering angle = Christoffel bulk-wave powerflow angle (frequency-independent "
+                "first-order estimate). Exact Lamb-wave steering is also frequency-dependent "
+                "(Neau, Deschamps & Lowe, 2001).",
+                ha="center", fontsize=7, color="#555"
+            )
+
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+            win = tk.Toplevel(self)
+            win.title("Directional Dispersion — Corrected Phase & Group Velocity")
+            win.geometry("1120x900")
+            canvas = FigureCanvasTkAgg(fig, master=win)
+            tb = NavigationToolbar2Tk(canvas, win, pack_toolbar=False)
+            tb.pack(side="bottom", fill="x")
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            canvas.draw()
+
+            out   = self._out_dir()
+            fpath = os.path.join(out, "directional_dispersion.png")
+            fig.savefig(fpath, dpi=150, bbox_inches="tight")
+            self._status.set(f"Directional dispersion saved → {fpath}")
+            self._log(f"Directional dispersion plot saved → {fpath}")
+
+        except Exception as e:
+            self._status.set("Directional dispersion error.")
+            messagebox.showerror("Directional Dispersion Error", f"{e}")
 
     # =======================================================================
     # SOLVE LOGIC
@@ -1076,9 +1533,9 @@ class App(tk.Tk):
             ("CFL safety factor  (?)",          "cfl",   "0.9", "cfl"),
             ("Tone burst cycles  (?)",          "cyc",   "3.5", "cyc"),
             ("Amplitude  (mm)  (?)",            "amp",   "0.05","amp"),
-            ("Total simulation time (µs)  (?)", "tsim",  "300", "tsim"),
-            ("Plate  L  (mm)  (?)",             "pL",    "300", "pL"),
-            ("Plate  W  (mm)  (?)",             "pW",    "300", "pW"),
+            ("Total simulation time (µs)  (?)", "tsim",  "100", "tsim"),
+            ("Plate  L  (mm)  (?)",             "pL",    "100", "pL"),
+            ("Plate  W  (mm)  (?)",             "pW",    "100", "pW"),
         ]
         self._abq = {}
         for r, (lbl, key, dflt, tip_key) in enumerate(input_defs):
@@ -1134,6 +1591,249 @@ class App(tk.Tk):
         row2.pack(fill="x", padx=4, pady=(2, 8))
         ttk.Button(row2, text="  Export All  (6 files)  ",
                    command=self._export_all_abaqus).pack(side="left", padx=5, ipady=4)
+
+    # =======================================================================
+    # TAB 5.1 — ABAQUS SCRIPT GENERATOR (FULL MODEL)
+    # =======================================================================
+    def _build_abaqus_fea(self):
+        p = self.tab_fea
+
+        # Main horizontal split
+        main = ttk.Frame(p)
+        main.pack(fill="both", expand=True, padx=10, pady=(8, 4))
+
+        # Left Column: Inputs
+        left = ttk.Frame(main)
+        left.pack(side="left", fill="y", padx=(0, 6))
+
+        # 1. Delamination Group
+        df = ttk.LabelFrame(left, text="Delamination Configuration")
+        df.pack(fill="x", pady=(0, 6))
+
+        self._fea = {}
+        delam_defs = [
+            ("Center X (mm)", "dcx", "50"),
+            ("Center Z (mm)", "dcz", "50"),
+            ("Size X (mm)",   "dsx", "20"),
+            ("Size Z (mm)",   "dsz", "20"),
+            ("Ply Interface (below delam)", "dint", "4"),
+        ]
+        for r, (lbl, key, dflt) in enumerate(delam_defs):
+            ttk.Label(df, text=lbl).grid(row=r, column=0, sticky="w", padx=10, pady=2)
+            v = tk.StringVar(value=dflt)
+            ttk.Entry(df, textvariable=v, width=12).grid(row=r, column=1, padx=10, pady=2)
+            self._fea[key] = v
+
+        # Damage List Management
+        lb_frame = ttk.Frame(df)
+        lb_frame.grid(row=len(delam_defs), column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        self._delam_lb = tk.Listbox(lb_frame, height=4, font=("Consolas", 8), bg="#1e1e2e", fg="#e0e0e0")
+        self._delam_lb.pack(side="left", fill="x", expand=True)
+        sb = ttk.Scrollbar(lb_frame, command=self._delam_lb.yview)
+        sb.pack(side="right", fill="y")
+        self._delam_lb.config(yscrollcommand=sb.set)
+
+        btn_f = ttk.Frame(df)
+        btn_f.grid(row=len(delam_defs)+1, column=0, columnspan=2, pady=5)
+        ttk.Button(btn_f, text="Add Damage", command=self._add_damage_to_list, width=12).pack(side="left", padx=5)
+        ttk.Button(btn_f, text="Clear List", command=self._clear_damage_list, width=12).pack(side="left", padx=5)
+
+        # 2. Sensor Group
+        sf = ttk.LabelFrame(left, text="Actuator & Sensors")
+        sf.pack(fill="x", pady=(0, 6))
+        
+        sens_defs = [
+            ("Actuator X (mm)",   "ax", "20"),
+            ("Actuator Z (mm)",   "az", "50"),
+            ("Actuator Radius (mm)", "ar", "3"),
+            ("Num. Sensors",     "snx", "7"),
+            ("Sensor Start X (mm)", "ssx", "70"),
+            ("Sensor Start Z (mm)", "ssz", "35"),
+            ("Sensor Spacing (mm)", "ssp", "5"),
+        ]
+        for r, (lbl, key, dflt) in enumerate(sens_defs):
+            ttk.Label(sf, text=lbl).grid(row=r, column=0, sticky="w", padx=10, pady=2)
+            v = tk.StringVar(value=dflt)
+            ttk.Entry(sf, textvariable=v, width=12).grid(row=r, column=1, padx=10, pady=2)
+            self._fea[key] = v
+
+        # 3. Actions
+        af = ttk.LabelFrame(left, text="Generator Actions")
+        af.pack(fill="x", pady=(0, 6))
+        
+        ttk.Button(af, text="Generate Healthy Script (.py)", 
+                   command=lambda: self._generate_fea_script(False)).pack(fill="x", padx=10, pady=5)
+        ttk.Button(af, text="Generate Damaged Script (.py)", 
+                   command=lambda: self._generate_fea_script(True)).pack(fill="x", padx=10, pady=5)
+        
+        ttk.Label(af, text="Model generation depends on solved\nparameters in 'Abaqus Parameters' tab.", 
+                  foreground="#666", font=("", 8)).pack(padx=10, pady=5)
+
+        # Right Column: Log
+        right = ttk.LabelFrame(main, text="Generation Activity Log")
+        right.pack(side="left", fill="both", expand=True)
+        
+        self._fea_log = tk.Text(right, state="disabled", font=("Consolas", 9),
+                                bg="#1a1a2e", fg="#e0e0e0", height=22)
+        sb = ttk.Scrollbar(right, command=self._fea_log.yview)
+        self._fea_log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._fea_log.pack(fill="both", expand=True, padx=4, pady=4)
+        
+        self._fea_log.config(state="normal")
+        self._fea_log.insert("end", "1. Solve Setup tab\n2. Solve Abaqus Parameters tab\n3. Click generate here.\n")
+        self._fea_log.config(state="disabled")
+
+    def _generate_fea_script(self, is_damaged):
+        """Invoke AbaqusEngine to build a full model script."""
+        # 1. Check if Setup Tab was solved
+        if not self._req_lamb():
+            return 
+            
+        # 2. Check if Abaqus Parameters Tab was computed
+        if self._abq_params is None:
+            messagebox.showwarning("Prerequisite Missing", 
+                                 "You must go to the 'Abaqus Parameters' tab and click \n"
+                                 "'Compute Abaqus Parameters' first to define mesh size and time step.")
+            return
+
+        try:
+            # Gather common inputs
+            angles = parse_layup(self._pv["layup"].get())
+            num_plies = len(angles)
+            
+            p = {
+                'mat_name': self._sv["mat_name"].get() or "Material",
+                'layup_str': self._pv["layup"].get(),
+                'angles': angles,
+                'thickness': float(self._pv["thickness"].get()),
+                'E1': float(self._pv["e1"].get()),
+                'E2': float(self._pv["e2"].get()),
+                'G12': float(self._pv["g12"].get()),
+                'G23': float(self._pv["g23"].get()),
+                'nu12': float(self._pv["nu12"].get()),
+                'rho': float(self._pv["rho"].get()),
+                
+                'plate_L': self._abq_params['plate_L'],
+                'plate_W': self._abq_params['plate_W'],
+                'mesh_size': self._abq_params['elem_mm'],
+                'dt': self._abq_params['dt'],
+                'cycles': self._abq_params['cycles'],
+                'freq_khz': self._abq_params['freq_khz'],
+                'amp_mm': self._abq_params['amp_mm'],
+                't_sim': self._abq_params['t_sim'],
+                
+                'actuator_x': float(self._fea['ax'].get()),
+                'actuator_z': float(self._fea['az'].get()),
+                'actuator_r': float(self._fea['ar'].get()),
+                
+                'sensor_nx': int(self._fea['snx'].get()),
+                'sensor_sx': float(self._fea['ssx'].get()),
+                'sensor_sz': float(self._fea['ssz'].get()),
+                'sensor_spacing': float(self._fea['ssp'].get()),
+            }
+
+            # --- Handle Damage Logic ---
+            if not is_damaged:
+                p['model_name'] = f"Healthy_{p['mat_name'].replace('/','_')}"
+                p['damages'] = []
+            else:
+                p['model_name'] = f"Damaged_{p['mat_name'].replace('/','_')}"
+                
+                # Logic Fix: If list is empty, use current entries. 
+                # If list NOT empty, use the list (but warn if entries changed and not added)
+                curr_damage = {
+                    'center_x': float(self._fea['dcx'].get()),
+                    'center_z': float(self._fea['dcz'].get()),
+                    'size_x': float(self._fea['dsx'].get()),
+                    'size_z': float(self._fea['dsz'].get())
+                }
+                
+                if not self._added_damages:
+                    p['damages'] = [curr_damage]
+                    self._log_fea("Using current delamination entries.")
+                else:
+                    p['damages'] = list(self._added_damages)
+                    # Simple check if current UI differs from last added damage
+                    last = self._added_damages[-1]
+                    if any(curr_damage[k] != last[k] for k in curr_damage):
+                        self._log_fea("NOTE: Using the 'Delamination List'. Current text-box values ignored.")
+                        self._log_fea("Tip: Click 'Add Damage' or 'Clear List' to use new values.")
+                
+                # Check Interface Validity
+                dint = int(self._fea['dint'].get())
+                if dint < 1 or dint >= num_plies:
+                    messagebox.showerror("Geometry Error", 
+                        f"Ply Interface {dint} is invalid for a {num_plies}-ply layup.\n"
+                        f"Choose a value between 1 and {num_plies-1}.")
+                    return
+                p['delam_interface'] = dint
+
+            # Run engine (validation happens in __init__)
+            engine = AbaqusEngine(p)
+            script_content = engine.generate_script(is_damaged)
+            
+            # --- SAVE FILE ---
+            out_dir = self.get_material_output_dir()
+            # Consolidate filenames to be predictable (User reported confusion with _multi suffix)
+            fname = "damaged_model.py" if is_damaged else "healthy_model.py"
+            full_path = os.path.join(out_dir, fname)
+            
+            with open(full_path, 'w') as f:
+                f.write(script_content)
+                
+            num_d = len(p.get('damages', []))
+            if is_damaged:
+                self._log_fea(f"Generated {num_d} delamination(s) → {full_path}")
+            else:
+                self._log_fea(f"Generated healthy model → {full_path}")
+                
+            messagebox.showinfo("Success", f"Abaqus script generated:\n{full_path}")
+            
+        except Exception as e:
+            messagebox.showerror("Generation Error", str(e))
+
+        self._fea_log.config(state="disabled")
+
+    def _log_fea(self, msg):
+        self._fea_log.config(state="normal")
+        self._fea_log.insert("end", f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        self._fea_log.see("end")
+        self._fea_log.config(state="disabled")
+
+    def _add_damage_to_list(self):
+        """Read current delamination inputs and add to the persistent list."""
+        try:
+            cx = float(self._fea['dcx'].get())
+            cz = float(self._fea['dcz'].get())
+            sx = float(self._fea['dsx'].get())
+            sz = float(self._fea['dsz'].get())
+            
+            damage = {
+                'center_x': cx,
+                'center_z': cz,
+                'size_x': sx,
+                'size_z': sz
+            }
+            self._added_damages.append(damage)
+            
+            # Update Listbox
+            idx = len(self._added_damages)
+            self._delam_lb.insert("end", f"#{idx}: ({cx}, {cz}) Size: {sx}x{sz}")
+            self._delam_lb.see("end")
+            
+            self._log_fea(f"Added damage #{idx}: at ({cx}, {cz})")
+            
+        except ValueError:
+            messagebox.showerror("Input Error", "Please enter valid numbers for delamination parameters.")
+
+    def _clear_damage_list(self):
+        """Reset the internal damage list and clear the UI listbox."""
+        self._added_damages = []
+        self._delam_lb.delete(0, "end")
+        self._log_fea("Cleared delamination list.")
+
 
     # =======================================================================
     # ABAQUS COMPUTATION
@@ -1729,6 +2429,154 @@ class App(tk.Tk):
                             f"6 files saved to:\n{self.get_material_output_dir()}")
 
     # =======================================================================
+    # TAB — SCIENTIFIC THEORY & VALIDATION
+    # =======================================================================
+    def _build_theory(self):
+        p = self.tab_theory
+        txt_frame = ttk.Frame(p)
+        txt_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        sb = ttk.Scrollbar(txt_frame)
+        sb.pack(side="right", fill="y")
+
+        t = tk.Text(
+            txt_frame, font=("Consolas", 9), bg="#1e1e2e", fg="#cdd6f4",
+            wrap="word", state="normal", yscrollcommand=sb.set,
+            padx=18, pady=18,
+        )
+        t.pack(fill="both", expand=True)
+        sb.config(command=t.yview)
+
+        # Styles
+        t.tag_config("title", foreground="#f9e2af", font=("Consolas", 14, "bold"))
+        t.tag_config("h1",    foreground="#89b4fa", font=("Consolas", 11, "bold"))
+        t.tag_config("h2",    foreground="#fab387", font=("Consolas", 10, "bold"))
+        t.tag_config("eq",    foreground="#a6e3a1", font=("Consolas", 10, "italic"))
+        t.tag_config("ref",   foreground="#94e2d5", font=("Consolas", 9))
+        t.tag_config("norm",  foreground="#cdd6f4", font=("Consolas", 9))
+        t.tag_config("blue",  foreground="#89b4fa")
+
+        def section(title):
+            t.insert("end", f"\n{'='*75}\n", "norm")
+            t.insert("end", f" {title}\n", "h1")
+            t.insert("end", f"{'='*75}\n", "norm")
+
+        t.insert("end", "SCIENTIFIC REFERENCE & THEORY MANUAL\n", "title")
+        t.insert("end", "Complete theoretical framework for the Lamb Wave Dispersion Toolkit.\n\n", "norm")
+
+        # --- Section 1 ---
+        section("1. BULK WAVE PHYSICS (ISOTROPIC VS. ANISOTROPIC)")
+        t.insert("end", "For Isotropic Materials:\n", "h2")
+        t.insert("end", """The material is defined by Young's Modulus (E) and Poisson's Ratio (v). 
+Bulk longitudinal (P) and shear (S) velocities are given by:
+""", "norm")
+        t.insert("end", "  cL = sqrt( E(1-v) / (rho*(1+v)*(1-2v)) )\n", "eq")
+        t.insert("end", "  cS = sqrt( G / rho ) where G = E / (2*(1+v))\n\n", "eq")
+
+        t.insert("end", "For Anisotropic CFRP (Advanced Mode):\n", "h2")
+        t.insert("end", """The ply is Transversely Isotropic. We define the 6x6 Stiffness [C] 
+using E1, E2, G12, G23, v12. In-plane shear v23 is computed via:
+""", "norm")
+        t.insert("end", "  v23 = E2 / (2 * G23) - 1\n", "eq")
+        t.insert("end", """
+Direction-dependent velocities (cL(theta), cS(theta)) are solved via the 
+Christoffel eigenvalue problem:
+""", "norm")
+        t.insert("end", "  det[ Gamma_ik - rho * c^2 * delta_ik ] = 0\n", "eq")
+
+        # --- Section 2 ---
+        section("2. LAMINATE HOMOGENIZATION (BACKUS THEORY)")
+        t.insert("end", """To analyze the whole laminate, the stack of rotated plies is homogenized 
+using Backus Averaging (1962). This represents the laminate as an 
+equivalent homogeneous medium (EHM) valid for waves with wavelengths 
+much larger than the ply thickness.
+""", "norm")
+        t.insert("end", """  <C11> = Average[ C11 - C13^2 / C33 ] + <C13/C33>^2 / <1/C33>
+  <C44> = 1 / Average[ 1 / C44 ]
+  <C66> = Average[ C66 ]
+""", "eq")
+        t.insert("end", """
+The 'Advanced Christoffel' solver uses this averaged [C_eff] to compute 
+accurate inputs for the Lamb equations at any propagation angle.
+""", "norm")
+
+        # --- Section 3 ---
+        section("3. RAYLEIGH-LAMB DISPERSION EQUATIONS")
+        t.insert("end", """Guided waves in a plate (Lamb waves) satisfy the traction-free boundary 
+conditions at z = +/- h. This leads to the frequency relations:
+""", "norm")
+        t.insert("end", "  Symmetric Modes (S):", "norm")
+        t.insert("end", "      tan(qh)/q + (4k^2 p*tan(ph)) / (q^2-k^2)^2 = 0\n", "eq")
+        t.insert("end", "  Antisymmetric Modes (A):", "norm")
+        t.insert("end", "      q*tan(qh) + ((q^2-k^2)^2 * tan(ph)) / (4k^2 p) = 0\n", "eq")
+        t.insert("end", """
+Variables:
+  p^2 = (omega/cL)^2 - k^2
+  q^2 = (omega/cS)^2 - k^2
+  k = wavenumber, omega = frequency (rad/s), h = d/2.
+""", "norm")
+
+        # --- Section 4 ---
+        section("4. WAVE STRUCTURE (EIGENFUNCTIONS)")
+        t.insert("end", """The through-thickness displacement profiles (u_x: in-plane, u_z: out-of-plane) 
+are derived from the potential functions:
+""", "norm")
+        t.insert("end", "For Symmetric (S) Modes:\n", "h2")
+        t.insert("end", "  u_x = j*(k*B*cos(py) + q*C*cos(qy))\n", "eq")
+        t.insert("end", "  u_z = -p*B*sin(py) + k*C*sin(qy)\n", "eq")
+        t.insert("end", "For Antisymmetric (A) Modes:\n", "h2")
+        t.insert("end", "  u_x = j*(k*A*sin(py) - q*D*sin(qy))\n", "eq")
+        t.insert("end", "  u_z = p*A*cos(py) + k*D*cos(qy)\n", "eq")
+
+        # --- Section 5 ---
+        section("5. GROUP VELOCITY & WAVENUMBER")
+        t.insert("end", """The phase velocity (vp) is the speed of individual wave crests, 
+but for damage detection (Time-of-Flight), we measure the Group Velocity (vg).
+""", "norm")
+        t.insert("end", "  Wavenumber (k):  k = omega / vp = 2*pi*f / vp\n", "eq")
+        t.insert("end", "  Group Velocity:  vg = d(omega) / dk = vp - lambda * d(vp)/d(lambda)\n", "eq")
+        t.insert("end", """
+This toolkit computes vg by taking the numerical derivative of the frequency 
+spectrum. Flat regions in the vg curves indicate low-dispersion 'plateaus' 
+ideal for SHM.
+""", "norm")
+
+        # --- Section 6 ---
+        section("6. ABAQUS/EXPLICIT PARAMETERS")
+        t.insert("end", """To ensure a high-fidelity Abaqus simulation, the mesh and time-step 
+must resolve the wave both spatially and temporally.
+""", "norm")
+        t.insert("end", "  1. Spatial Resolution (lambda/10 rule):\n", "h2")
+        t.insert("end", "     Le = lambda_min / 10\n", "eq")
+        t.insert("end", "  2. Temporal Resolution (CFL Stability Condition):\n", "h2")
+        t.insert("end", "     dt <= CFL * Le / (cL * sqrt(3))\n", "eq")
+        t.insert("end", "  3. Excitation Signal (Hanning-windowed Tone Burst):\n", "h2")
+        t.insert("end", "     u(t) = A/2 * sin(2*pi*fc*t) * (1 - cos(2*pi*fc*t/N_cycles))\n", "eq")
+
+        # --- Section 7 ---
+        section("7. NUMERICAL STRATEGY & SOLVER")
+        t.insert("end", """The toolkit finds the roots of the transcendental equations using a 
+Bisection-Search (scipy.optimize.bisect) over the phase-velocity space.
+
+Process:
+  1. Sweep fd (frequency * thickness) from 0 to fd_max.
+  2. For each fd, scan vp from 0 to vp_max at intervals of 'vp_step'.
+  3. Detect sign changes in the Rayleigh-Lamb equation.
+  4. Perform bisection to converge on the exact root (velocity).
+  5. Repeat for symmetric and antisymmetric families.
+""", "norm")
+
+        # --- Section 8 ---
+        section("8. VALIDATION & LITERATURE")
+        t.insert("end", "Core references used for calculation and verification:\n", "blue")
+        t.insert("end", "  • Rose, J. L. (2014) 'Ultrasonic Guided Waves in Solid Media'.\n", "ref")
+        t.insert("end", "  • Backus, G. E. (1962) 'Elastic anisotropy... horizontal layering'.\n", "ref")
+        t.insert("end", "  • Daniel & Ishai (2006) 'Engineering Mechanics of Composite Materials'.\n", "ref")
+        t.insert("end", "  • Wang, J. T. et al. (NASA/TM-2014-218368) 'Detecting Damage... Lamb Waves'.\n", "ref")
+
+        t.config(state="disabled")
+
+    # =======================================================================
     # TAB — HELP / GUIDE
     # =======================================================================
     def _build_help(self):
@@ -1817,6 +2665,23 @@ class App(tk.Tk):
     speeds from the ply properties above using Classical Laminate Theory (CLT)
     invariants for a quasi-isotropic [0/45/-45/90]s layup.
     You may also type values directly if you have measured them ultrasonically.
+
+    "cL":   "Longitudinal wave speed (m/s). Fast wave where particles move in direction of travel.",
+    "cS":   "Shear wave speed (m/s). Slower wave where particles move perpendicular to travel.",
+    "cR":   "Rayleigh (Surface) wave speed. Restricted mostly to the top surface of the plate.",
+    
+    # Bulk / Christoffel Tips
+    "c_qP":  "qP: Quasi-Longitudinal bulk wave. Particles move mostly parallel to wave direction.",
+    "c_qSH": "qSH: Quasi-Shear Horizontal. Particles move in-plane, perpendicular to direction. Critical for S0 Lamb mode.",
+    "c_qSV": "qSV: Quasi-Shear Vertical. Particles move out-of-plane. Critical for A0 Lamb mode.",
+    "iso_P": "Isotropic P-wave: Speed if the material fibers were completely random/unaligned.",
+    "iso_S": "Isotropic S-wave: Shear speed for a random fiber orientation.",
+    "vg_qP": "Group Velocity: The speed of energy transport (the pulse itself).",
+    "vg_qSH": "Group Velocity for SH wave. Often used to predict pulse windowing in Abaqus.",
+    "vg_qSV": "Group Velocity for SV wave.",
+    "pf_qP":  "Powerflow Angle: Deviation angle between the way you wave 'looks' and where the energy travels.",
+    "pf_qSH": "SH Powerflow: Shows how much energy 'skews' away from the sensor at this angle.",
+    "pf_qSV": "SV Powerflow.",
 """, "tip")
         row("c_L  (m/s)",
             "Longitudinal bulk wave speed.  Used as vp_max reference and CFL denominator.")

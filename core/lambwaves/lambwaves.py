@@ -65,6 +65,7 @@ in Plates and Rods, Dover Publications, 1975.
 """
 
 
+import os
 import numpy as np
 
 import matplotlib.pyplot as plt
@@ -209,11 +210,15 @@ class Lamb:
             function=self._antisymmetric, nmodes=nmodes_antisym, c=c_L, label="A"
         )
 
+        # Ensure results directory exists
+        os.makedirs("results", exist_ok=True)
+
         # Calculate group velocity (vg) and wavenumber (k) from phase
         # velocity (vp) and interpolate all results.
 
         self.vp_sym, self.vg_sym, self.k_sym = interpolate(sym, self.d)
         self.vp_antisym, self.vg_antisym, self.k_antisym = interpolate(antisym, self.d)
+
 
     def _calc_constants(self, vp, fd):
         """Calculate the constants p and q (defined to simplify the
@@ -448,6 +453,7 @@ class Lamb:
     def animate_displacement(
         self, mode, fd, speed=30, save_gif=False, save_video=False
     ):
+
         """Generate an animation of the displacement vector field across
         the plate. The mesh grid created cover a full wavelength of the
         current selected wave mode and fd value.
@@ -591,8 +597,9 @@ class Lamb:
             plt.rcParams["animation.ffmpeg_path"] = Lamb.ffmpeg_path
             anim.save(
                 f"results/Mode_{mode}_fd_{int(fd)}_animation.{save_video}",
-                writer="imagemagick",
+                writer="ffmpeg",
             )
+
 
         return fig, ax
 
@@ -656,9 +663,14 @@ class Lamb:
         cutoff_frequencies=True,
         material_velocities=True,
         save_img=False,
-        sym_style={"color": "blue"},
-        antisym_style={"color": "red"},
+        sym_style=None,
+        antisym_style=None,
     ):
+        if sym_style is None:
+            sym_style = {"color": "blue"}
+        if antisym_style is None:
+            antisym_style = {"color": "red"}
+
         """Generate a plot of phase velocity as a function of frequency
         × thickness.
 
@@ -755,9 +767,14 @@ class Lamb:
         modes="both",
         cutoff_frequencies=True,
         save_img=False,
-        sym_style={"color": "blue"},
-        antisym_style={"color": "red"},
+        sym_style=None,
+        antisym_style=None,
     ):
+        if sym_style is None:
+            sym_style = {"color": "blue"}
+        if antisym_style is None:
+            antisym_style = {"color": "red"}
+
         """Generate a plot of group velocity as a function of frequency
         × thickness.
 
@@ -836,9 +853,14 @@ class Lamb:
         self,
         modes="both",
         save_img=False,
-        sym_style={"color": "blue"},
-        antisym_style={"color": "red"},
+        sym_style=None,
+        antisym_style=None,
     ):
+        if sym_style is None:
+            sym_style = {"color": "blue"}
+        if antisym_style is None:
+            antisym_style = {"color": "red"}
+
         """Generate a plot of wavenumber as a function of frequency ×
         thickness.
 
@@ -900,9 +922,14 @@ class Lamb:
         ncols,
         fd,
         save_img=False,
-        inplane_style={"color": "blue"},
-        outofplane_style={"color": "red"},
+        inplane_style=None,
+        outofplane_style=None,
     ):
+        if inplane_style is None:
+            inplane_style = {"color": "blue"}
+        if outofplane_style is None:
+            outofplane_style = {"color": "red"}
+
         """Generate a plot of the wave structure, i.e., the in-plane and
         out-of-plane displacement profiles across the thickness of the
         plate.

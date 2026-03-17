@@ -39,7 +39,7 @@ LWD_PATH   = SCRIPT_DIR
 if LWD_PATH not in sys.path:
     sys.path.insert(0, LWD_PATH)
 
-from lambwaves import Lamb
+from core.lambwaves import Lamb
 
 # ===========================================================================
 # CFRP MATERIAL PARAMETERS  (identical to dispersion_analysis.py)
